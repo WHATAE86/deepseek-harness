@@ -178,28 +178,60 @@ log('copying the Web frontend')
 await cp(join(root, 'apps', 'web', 'dist'), join(out, 'apps', 'web', 'dist'), { recursive: true })
 
 /**
+ * List every symlink below `dir`, without following any of them.
+ * @param {string} dir - Root to walk.
+ * @returns {Promise<string[]>} Absolute paths of symlinks.
+ */
+async function findSymlinks(dir) {
+  const found = []
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name)
+    const info = await lstat(path)
+    if (info.isSymbolicLink()) {
+      found.push(path)
+      continue
+    }
+    if (info.isDirectory()) found.push(...await findSymlinks(path))
+  }
+  return found
+}
+
+/**
  * Replace every symlink below `dir` with the bytes it points at. exFAT cannot
  * store symlinks, and a payload destined for a USB drive must not contain any.
  * Junctioned workspace packages are the ones legacy deploy leaves behind, and
  * they always point at another directory inside the same tree.
+ *
+ * Copying a link target can introduce new symlinks of its own (a junctioned
+ * package carries its own nested node_modules), so this repeats until a full
+ * pass finds nothing left to replace.
  * @param {string} dir - Root whose subtree is materialized in place.
  * @returns {Promise<string[]>} Paths that were replaced.
  */
 async function materializeSymlinks(dir) {
   const replaced = []
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name)
-    const info = await lstat(path)
-    if (info.isSymbolicLink()) {
-      const target = await realpath(path)
+  for (let pass = 0; pass < 32; pass++) {
+    const found = await findSymlinks(dir)
+    if (found.length === 0) return replaced
+    for (const path of found) {
+      let target
+      try {
+        target = await realpath(path)
+      } catch {
+        // A dangling link names nothing copyable; drop it rather than fail the
+        // build, because the deploy never resolves through it.
+        await rm(path, { recursive: true, force: true })
+        replaced.push(path)
+        continue
+      }
       await rm(path, { recursive: true, force: true })
-      await cp(target, path, { recursive: true })
+      // `dereference` matters: without it, cp copies nested links as links,
+      // which is the whole thing this function exists to prevent.
+      await cp(target, path, { recursive: true, dereference: true })
       replaced.push(path)
-      continue
     }
-    if (info.isDirectory()) replaced.push(...await materializeSymlinks(path))
   }
-  return replaced
+  throw new Error(`build-portable-runtime: symlinks still present after 32 passes in ${dir}`)
 }
 
 log('materializing symlinks so the payload survives exFAT')
@@ -207,20 +239,11 @@ const replaced = await materializeSymlinks(out)
 for (const path of replaced) log(`  materialized ${path.slice(out.length + 1)}`)
 
 // Prove the payload is symlink-free after materialization.
-const offenders = []
-async function scanSymlinks(dir) {
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name)
-    const info = await lstat(path)
-    if (info.isSymbolicLink()) offenders.push(path)
-    else if (info.isDirectory()) await scanSymlinks(path)
-  }
-}
-await scanSymlinks(out)
+const offenders = await findSymlinks(out)
 if (offenders.length > 0) {
+  const list = offenders.slice(0, 10).join('\n')
   throw new Error(
-    `build-portable-runtime: payload still contains ${offenders.length} symlinks:\n`
-    + offenders.slice(0, 10).join('\n'),
+    `build-portable-runtime: payload still contains ${offenders.length} symlinks:\n${list}`,
   )
 }
 
