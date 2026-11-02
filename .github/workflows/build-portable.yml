@@ -130,20 +130,24 @@ jobs:
           "$stage/node/$TARGET/node" --version
 
           # Plugin installs shell out to pnpm, which the target machine also
-          # lacks. Take the pnpm this job already runs on, so the version
-          # matches the repository's packageManager pin.
-          for candidate in \
-            "$(command -v pnpm || true)" \
-            "$HOME/.local/share/pnpm/pnpm" \
-            "$PNPM_HOME/pnpm"
-          do
-            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-              cp "$candidate" "$stage/node/$TARGET/pnpm"
-              chmod +x "$stage/node/$TARGET/pnpm"
-              "$stage/node/$TARGET/pnpm" --version
-              break
-            fi
-          done
+          # lacks. pnpm 11 ships as a JavaScript package whose bin is a script,
+          # so copying `command -v pnpm` yields a wrapper that resolves its own
+          # bin relative to a path that no longer exists. pnpm 12 publishes
+          # per-platform standalone executables instead, so take one of those.
+          PNPM_VERSION=12.9.1
+          case "$PLATFORM" in
+            linux)  PNPM_PKG="exe.linux-$ARCH" ;;
+            darwin) PNPM_PKG="exe.darwin-$ARCH" ;;
+            *)      echo "::error::Unsupported platform for pnpm: $PLATFORM"; exit 1 ;;
+          esac
+          curl -fsSL \
+            "https://registry.npmjs.org/@pnpm/$PNPM_PKG/-/$PNPM_PKG-$PNPM_VERSION.tgz" \
+            -o /tmp/pnpm.tgz
+          mkdir -p /tmp/pnpm-x
+          tar -xzf /tmp/pnpm.tgz -C /tmp/pnpm-x
+          cp "/tmp/pnpm-x/package/pnpm" "$stage/node/$TARGET/pnpm"
+          chmod +x "$stage/node/$TARGET/pnpm"
+          "$stage/node/$TARGET/pnpm" --version
 
           # Portable harness home: profile manifest, pnpm settings, patch layer.
           cp portable/profile/package.json        "$stage/home/profiles/web/package.json"
