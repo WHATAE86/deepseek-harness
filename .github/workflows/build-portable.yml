@@ -1,0 +1,167 @@
+name: Build portable runtimes
+
+# Builds a runnable DeepSeek Harness payload for macOS and Linux, shaped for a
+# portable USB drive. The repository's own executable builder targets the
+# Python SDK closure, which mounts the `sdk` profile and carries no Web
+# frontend, so this workflow assembles the `web` profile instead.
+#
+# Native modules (node-pty, koffi, @deepseek-ai/node-addon-system) compile only
+# for the host platform, so each target builds on its own runner rather than
+# cross-compiling.
+#
+# Trigger it manually from Actions, or push a tag `portable-v*`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: >-
+          Comma-separated matrix targets. Any subset of:
+          macos-arm64, macos-x64, linux-x64, linux-arm64. Empty builds all four.
+        type: string
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'portable-v*'
+
+permissions:
+  contents: read
+
+env:
+  # CI runs must never report to the production telemetry endpoint.
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  plan:
+    name: plan targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Compute the build matrix
+        id: plan
+        env:
+          # A manual dispatch without targets builds everything.
+          TARGETS: ${{ inputs.targets || 'macos-arm64,macos-x64,linux-x64,linux-arm64' }}
+        run: |
+          set -euo pipefail
+          matrix='[]'
+          IFS=',' read -r -a targets <<< "$TARGETS"
+          for raw in "${targets[@]}"; do
+            t="$(echo "$raw" | xargs)" # trim surrounding whitespace
+            [ -z "$t" ] && continue
+            case "$t" in
+              macos-arm64) runner=macos-latest;     platform=darwin; arch=arm64 ;;
+              macos-x64)   runner=macos-15-intel;   platform=darwin; arch=x64 ;;
+              linux-x64)   runner=ubuntu-latest;    platform=linux;  arch=x64 ;;
+              linux-arm64) runner=ubuntu-24.04-arm; platform=linux;  arch=arm64 ;;
+              *)
+                echo "::error::Unknown target '$t'. Supported: macos-arm64, macos-x64, linux-x64, linux-arm64."
+                exit 1
+                ;;
+            esac
+            matrix="$(jq -c --arg t "$t" --arg r "$runner" --arg p "$platform" --arg a "$arch" \
+              '. + [{target: $t, runner: $r, platform: $p, arch: $a}]' <<< "$matrix")"
+          done
+          if [ "$matrix" = '[]' ]; then
+            echo "::error::The targets input selected nothing to build."
+            exit 1
+          fi
+          echo "Matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          # The repository pins this exact version in package.json.
+          version: 11.28.5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the portable payload
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          node scripts/build-portable-runtime.mjs \
+            --out "$PWD/dist-portable" \
+            --platform "$PLATFORM" \
+            --arch "$ARCH"
+
+      - name: Assemble the portable folder
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="stage"
+          rm -rf "$stage" "capri-$TARGET.tar.gz"
+          mkdir -p "$stage/dsh/$TARGET" "$stage/node/$TARGET" "$stage/home/profiles/web"
+
+          # Runtime payload: everything the deploy produced.
+          cp -R dist-portable/. "$stage/dsh/$TARGET/"
+          rm -f "$stage/dsh/$TARGET/PORTABLE-BUILD.json"
+
+          # The target machine may have no Node.js, so ship the runner's own.
+          cp "$(command -v node)" "$stage/node/$TARGET/node"
+          chmod +x "$stage/node/$TARGET/node"
+          "$stage/node/$TARGET/node" --version
+
+          # Plugin installs shell out to pnpm, which the target machine also
+          # lacks. Take the pnpm this job already runs on, so the version
+          # matches the repository's packageManager pin.
+          for candidate in \
+            "$(command -v pnpm || true)" \
+            "$HOME/.local/share/pnpm/pnpm" \
+            "$PNPM_HOME/pnpm"
+          do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+              cp "$candidate" "$stage/node/$TARGET/pnpm"
+              chmod +x "$stage/node/$TARGET/pnpm"
+              "$stage/node/$TARGET/pnpm" --version
+              break
+            fi
+          done
+
+          # Portable harness home: profile manifest, pnpm settings, patch layer.
+          cp portable/profile/package.json        "$stage/home/profiles/web/package.json"
+          cp portable/profile/pnpm-workspace.yaml "$stage/home/profiles/web/pnpm-workspace.yaml"
+          cp portable/profile/cordis.patch.yml    "$stage/home/profiles/web/cordis.patch.yml"
+
+          # Launcher, taken from the repository checkout.
+          cp portable/start.sh "$stage/start.sh"
+          chmod +x "$stage/start.sh"
+
+          # Ship the staging directory under its real name inside the archive.
+          mv "$stage" "capri-$TARGET"
+          tar -czf "capri-$TARGET.tar.gz" "capri-$TARGET"
+          du -sh "capri-$TARGET.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capri-${{ matrix.target }}
+          path: capri-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14

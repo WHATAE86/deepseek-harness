@@ -1,0 +1,15 @@
+{
+  "name": "capri-profile-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Plugin profile for the portable DeepSeek Harness.",
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app"
+      ]
+    }
+  },
+  "dependencies": {}
+}

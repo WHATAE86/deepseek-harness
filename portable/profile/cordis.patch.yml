@@ -1,0 +1,22 @@
+# Portable profile patch layer for the `web` profile.
+#
+# Layers apply over the shipped bundles, so any row set here wins. The payload
+# targets a portable drive, so two shipped defaults are adjusted:
+#
+# The file must stay a top-level YAML array of loader patch entries.
+
+# Spill files are large tool-output buffers. The shipped default creates them
+# with mkdtemp under the OS temp directory, which is not always writable and
+# never travels with the drive. Keep them inside the harness home instead.
+- id: spill-local
+  name: '@deepseek-ai/dsh-spill-local'
+  config:
+    root: spill
+
+# Plugin installs shell out to pnpm. The host machine may have no Node.js,
+# hence no pnpm on PATH, so the launcher exports CAPRI_PNPM as the absolute
+# path of the copy bundled beside the runtime.
+- id: plugin-manager
+  name: '@deepseek-ai/dsh-plugin-manager'
+  config:
+    pnpmCommand: !!js "process.env.CAPRI_PNPM ?? 'pnpm'"

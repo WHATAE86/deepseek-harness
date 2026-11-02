@@ -1,0 +1,10 @@
+# pnpm 12 reads build-shaping options from this file, not from .npmrc.
+#
+# The drive holding this profile may be exFAT, which cannot store symlinks and
+# has no notion of hard links. Two defaults therefore break plugin installs:
+#   * `isolated` node linker builds node_modules from symlinks into .pnpm
+#   * `hardlink` package import links files straight out of the store
+# Both are disabled below, so an install writes real directories and real file
+# copies that any filesystem can store.
+nodeLinker: hoisted
+packageImportMethod: copy
